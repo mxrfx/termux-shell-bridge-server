@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -7,6 +8,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
@@ -21,12 +23,59 @@ if not TOKEN_FILE.exists():
 
 TOKEN = TOKEN_FILE.read_text(encoding="utf-8").strip()
 BASH = "/data/data/com.termux/files/usr/bin/bash"
-HOME = os.environ.get(
-    "HOME",
-    "/data/data/com.termux/files/home"
-)
+HOME = "/data/data/com.termux/files/home"
+MAX_OUTPUT = 50000
+MAX_COMMAND = 20000
+MAX_JOBS = 3
+MAX_TIMEOUT = 120000
 
 jobs = {}
+jobs_lock = __import__("threading").Lock()
+
+
+def redact(text):
+    if not text:
+        return ""
+
+    patterns = [
+        (
+            r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+",
+            r"\1[REDACTED]"
+        ),
+        (
+            r"(?i)(token|password|passwd|api[_-]?key|secret)"
+            r"(\s*[:=]\s*)[^\s\"']+",
+            r"\1\2[REDACTED]"
+        ),
+        (
+            r"(?i)(sk-[a-z0-9_-]{10,})",
+            "[REDACTED_KEY]"
+        ),
+    ]
+
+    result = str(text)
+
+    for pattern, replacement in patterns:
+        result = re.sub(pattern, replacement, result)
+
+    return result
+
+
+def write_audit(kind, data):
+    path = LOG_DIR / "audit.log"
+
+    record = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "kind": kind,
+        **data,
+    }
+
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(
+            record,
+            ensure_ascii=False
+        ) + "\n")
+
 
 def send_json(handler, status, data):
     raw = json.dumps(
@@ -58,18 +107,21 @@ def send_json(handler, status, data):
     handler.end_headers()
     handler.wfile.write(raw)
 
+
 def authorized(handler):
-    value = handler.headers.get("Authorization", "")
-    return value == f"Bearer {TOKEN}"
+    return handler.headers.get("Authorization", "") == (
+        f"Bearer {TOKEN}"
+    )
+
 
 def read_body(handler):
     size = int(handler.headers.get("Content-Length", "0"))
 
-    if size > 20000:
+    if size > 30000:
         raise ValueError("请求内容过大")
 
-    raw = handler.rfile.read(size)
-    return json.loads(raw or b"{}")
+    return json.loads(handler.rfile.read(size) or b"{}")
+
 
 def shell_env():
     return {
@@ -83,7 +135,8 @@ def shell_env():
         "NO_COLOR": "1",
     }
 
-def stop_group(process, force=False):
+
+def kill_process_group(process, force=False):
     try:
         os.killpg(
             process.pid,
@@ -91,6 +144,7 @@ def stop_group(process, force=False):
         )
     except ProcessLookupError:
         pass
+
 
 def run_shell(command, cwd, timeout):
     started = time.time()
@@ -109,32 +163,72 @@ def run_shell(command, cwd, timeout):
     timed_out = False
 
     try:
-        stdout, stderr = process.communicate(
-            timeout=timeout
-        )
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        stop_group(process)
+        kill_process_group(process)
 
         try:
             stdout, stderr = process.communicate(timeout=3)
         except subprocess.TimeoutExpired:
-            stop_group(process, force=True)
+            kill_process_group(process, force=True)
             stdout, stderr = process.communicate()
 
-    return {
+    result = {
         "ok": process.returncode == 0 and not timed_out,
         "exit_code": -1 if timed_out else process.returncode,
-        "stdout": (stdout or "")[-50000:],
+        "stdout": (stdout or "")[-MAX_OUTPUT:],
         "stderr": (
             "命令超时，进程组已终止"
             if timed_out
-            else (stderr or "")[-50000:]
+            else (stderr or "")[-MAX_OUTPUT:]
         ),
         "duration_ms": round(
             (time.time() - started) * 1000
         ),
     }
+
+    write_audit(
+        "shell",
+        {
+            "command": redact(command),
+            "cwd": redact(cwd or HOME),
+            "ok": result["ok"],
+            "exit_code": result["exit_code"],
+            "stdout": redact(result["stdout"])[-5000:],
+            "stderr": redact(result["stderr"])[-5000:],
+        }
+    )
+
+    return result
+
+
+def job_info(job_id, job):
+    process = job["process"]
+    log_path = job["log"]
+
+    try:
+        log_text = log_path.read_text(
+            encoding="utf-8",
+            errors="replace"
+        )[-MAX_OUTPUT:]
+    except FileNotFoundError:
+        log_text = ""
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": (
+            "running"
+            if process.poll() is None
+            else "finished"
+        ),
+        "exit_code": process.poll(),
+        "log": redact(log_text),
+        "log_file": str(log_path),
+        "command": redact(job["command"]),
+    }
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -165,6 +259,12 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         if self.path == "/health":
+            with jobs_lock:
+                running = sum(
+                    job["process"].poll() is None
+                    for job in jobs.values()
+                )
+
             return send_json(
                 self,
                 200,
@@ -172,12 +272,29 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "service": "termux-shell-bridge",
                     "jobs": len(jobs),
+                    "running_jobs": running,
+                    "max_jobs": MAX_JOBS,
                 }
             )
 
+        if self.path == "/jobs":
+            with jobs_lock:
+                result = [
+                    job_info(job_id, job)
+                    for job_id, job in jobs.items()
+                ]
+
+            return send_json(
+                self,
+                200,
+                {"ok": True, "jobs": result}
+            )
+
         if self.path.startswith("/jobs/"):
-            job_id = self.path.split("/")[2]
-            job = jobs.get(job_id)
+            job_id = unquote(self.path.split("/")[2])
+
+            with jobs_lock:
+                job = jobs.get(job_id)
 
             if not job:
                 return send_json(
@@ -186,20 +303,10 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "任务不存在"}
                 )
 
-            process = job["process"]
             return send_json(
                 self,
                 200,
-                {
-                    "job_id": job_id,
-                    "status": (
-                        "running"
-                        if process.poll() is None
-                        else "finished"
-                    ),
-                    "exit_code": process.poll(),
-                    "log": str(job["log"]),
-                }
+                job_info(job_id, job)
             )
 
         return send_json(
@@ -235,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": "命令为空"}
                 )
 
-            if len(command) > 20000:
+            if len(command) > MAX_COMMAND:
                 return send_json(
                     self,
                     400,
@@ -244,16 +351,18 @@ class Handler(BaseHTTPRequestHandler):
 
             timeout = min(
                 max(int(data.get("timeout", 30000)), 1000),
-                120000
+                MAX_TIMEOUT
             )
 
-            result = run_shell(
-                command,
-                data.get("cwd") or HOME,
-                timeout / 1000
+            return send_json(
+                self,
+                200,
+                run_shell(
+                    command,
+                    data.get("cwd") or HOME,
+                    timeout / 1000
+                )
             )
-
-            return send_json(self, 200, result)
 
         if self.path == "/jobs/start":
             command = str(data.get("command", "")).strip()
@@ -264,6 +373,23 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                     {"error": "命令为空"}
                 )
+
+            with jobs_lock:
+                running = sum(
+                    job["process"].poll() is None
+                    for job in jobs.values()
+                )
+
+                if running >= MAX_JOBS:
+                    return send_json(
+                        self,
+                        429,
+                        {
+                            "error": (
+                                f"后台任务已达到上限：{MAX_JOBS}"
+                            )
+                        }
+                    )
 
             job_id = uuid.uuid4().hex[:12]
             log_path = LOG_DIR / f"{job_id}.log"
@@ -280,11 +406,23 @@ class Handler(BaseHTTPRequestHandler):
                 text=True,
             )
 
-            jobs[job_id] = {
+            job = {
                 "process": process,
                 "log": log_path,
                 "file": log_file,
+                "command": command,
             }
+
+            with jobs_lock:
+                jobs[job_id] = job
+
+            write_audit(
+                "job_start",
+                {
+                    "job_id": job_id,
+                    "command": redact(command),
+                }
+            )
 
             return send_json(
                 self,
@@ -292,6 +430,34 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "job_id": job_id,
+                    "max_jobs": MAX_JOBS,
+                }
+            )
+
+        if self.path == "/jobs/stop-all":
+            stopped = []
+
+            with jobs_lock:
+                items = list(jobs.items())
+
+            for job_id, job in items:
+                process = job["process"]
+
+                if process.poll() is None:
+                    kill_process_group(process)
+                    stopped.append(job_id)
+
+            write_audit(
+                "job_stop_all",
+                {"jobs": stopped}
+            )
+
+            return send_json(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "stopped": stopped,
                 }
             )
 
@@ -299,8 +465,10 @@ class Handler(BaseHTTPRequestHandler):
             self.path.startswith("/jobs/")
             and self.path.endswith("/stop")
         ):
-            job_id = self.path.split("/")[2]
-            job = jobs.get(job_id)
+            job_id = unquote(self.path.split("/")[2])
+
+            with jobs_lock:
+                job = jobs.get(job_id)
 
             if not job:
                 return send_json(
@@ -312,7 +480,12 @@ class Handler(BaseHTTPRequestHandler):
             process = job["process"]
 
             if process.poll() is None:
-                stop_group(process)
+                kill_process_group(process)
+
+            write_audit(
+                "job_stop",
+                {"job_id": job_id}
+            )
 
             return send_json(
                 self,
@@ -329,7 +502,12 @@ class Handler(BaseHTTPRequestHandler):
             {"error": "Not found"}
         )
 
-server = ThreadingHTTPServer(
+
+class ReusableServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+server = ReusableServer(
     ("127.0.0.1", 8765),
     Handler
 )
@@ -340,4 +518,16 @@ print(
     flush=True
 )
 
-server.serve_forever()
+try:
+    server.serve_forever()
+except KeyboardInterrupt:
+    pass
+finally:
+    with jobs_lock:
+        items = list(jobs.items())
+
+    for _, job in items:
+        if job["process"].poll() is None:
+            kill_process_group(job["process"])
+
+    server.server_close()
